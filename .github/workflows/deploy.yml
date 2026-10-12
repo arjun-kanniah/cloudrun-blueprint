@@ -1,0 +1,110 @@
+# Reusable deploy for an app built with the service module: build and push the image, run the
+# jobs (migrations) on it, roll out the new revision, then check that it answers.
+#
+# Authenticates with Workload Identity Federation: no service-account keys anywhere. The caller
+# must grant `id-token: write`. See the README for an example.
+name: Deploy to Cloud Run
+
+on:
+  workflow_call:
+    inputs:
+      workload_identity_provider:
+        description: The project module's workload_identity_provider output.
+        type: string
+        required: true
+      service_account:
+        description: The service module's deploy_service_account output.
+        type: string
+        required: true
+      region:
+        type: string
+        required: true
+      service:
+        description: Cloud Run service name (the service module's name).
+        type: string
+        required: true
+      image:
+        description: The service module's image output, without a tag. Tagged with the commit SHA.
+        type: string
+        required: true
+      jobs:
+        description: Space-separated job names to update and run, in order, before the rollout.
+        type: string
+        default: ""
+      context:
+        description: Docker build context.
+        type: string
+        default: .
+      dockerfile:
+        description: Path to the Dockerfile.
+        type: string
+        default: ""
+      health_path:
+        description: Path that must answer 2xx after the rollout.
+        type: string
+        default: /
+      public_url:
+        description: Also check health_path at this URL, e.g. a custom domain.
+        type: string
+        default: ""
+    outputs:
+      url:
+        description: The service's run.app URL.
+        value: ${{ jobs.deploy.outputs.url }}
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    concurrency:
+      group: deploy-${{ inputs.service }}
+      cancel-in-progress: false
+    outputs:
+      url: ${{ steps.verify.outputs.url }}
+    env:
+      REGION: ${{ inputs.region }}
+      SERVICE: ${{ inputs.service }}
+      IMAGE: ${{ inputs.image }}:${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ inputs.workload_identity_provider }}
+          service_account: ${{ inputs.service_account }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - run: gcloud auth configure-docker "${IMAGE%%/*}" --quiet
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          push: true
+          tags: ${{ env.IMAGE }}
+          cache-from: type=gha,scope=${{ inputs.service }}
+          cache-to: type=gha,mode=max,scope=${{ inputs.service }}
+      - name: Run jobs
+        if: inputs.jobs != ''
+        env:
+          JOBS: ${{ inputs.jobs }}
+        run: |
+          for job in $JOBS; do
+            gcloud run jobs update "$job" --image "$IMAGE" --region "$REGION" --quiet
+            gcloud run jobs execute "$job" --region "$REGION" --wait
+          done
+      - name: Deploy
+        run: gcloud run services update "$SERVICE" --image "$IMAGE" --region "$REGION" --quiet
+      - name: Smoke test
+        id: verify
+        env:
+          HEALTH_PATH: ${{ inputs.health_path }}
+          PUBLIC_URL: ${{ inputs.public_url }}
+        run: |
+          url=$(gcloud run services describe "$SERVICE" --region "$REGION" --format='value(status.url)')
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          curl -sf --retry 5 --retry-all-errors -o /dev/null "$url$HEALTH_PATH"
+          if [ -n "$PUBLIC_URL" ]; then
+            curl -sf --retry 5 --retry-all-errors -o /dev/null "$PUBLIC_URL$HEALTH_PATH"
+          fi

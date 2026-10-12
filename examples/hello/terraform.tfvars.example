@@ -1,0 +1,4 @@
+project_id        = "my-project"
+github_repository = "me/hello"
+# billing_account = "XXXXXX-XXXXXX-XXXXXX"
+# domain          = { zone = "example.dev", hostname = "hello.example.dev" }

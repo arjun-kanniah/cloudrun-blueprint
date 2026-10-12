@@ -1,0 +1,4 @@
+# Toolchain. Run `mise install` once; versions are pinned for everyone.
+[tools]
+just = "1.58"
+terraform = "1.15"
